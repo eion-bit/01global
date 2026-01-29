@@ -9,6 +9,10 @@ on:
       deploy_path:
         required: true
         type: string
+      pre_build:           # ⭐ NEW INPUT
+        required: false
+        type: string
+        default: ""
     secrets:
       SSH_PRIVATE_KEY:
         required: true
@@ -39,12 +43,21 @@ jobs:
         with:
           node-version: 20
           cache: npm
+
+      # ⭐ NEW: Run pre-build hook
+      - name: Run pre-build commands
+        if: ${{ inputs.pre_build != '' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          bash -c "${{ inputs.pre_build }}"
+
       - name: Install & build
         shell: bash
         env:
-          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
-          VITE_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.VITE_SUPABASE_PUBLISHABLE_KEY }}
-          VITE_SUPABASE_PROJECT_ID: ${{ secrets.VITE_SUPABASE_PROJECT_ID }}
+          VITE_SUPABASE_URL: ${{ env.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ env.VITE_SUPABASE_ANON_KEY }}
+          VITE_SUPABASE_PROJECT_ID: ${{ env.VITE_SUPABASE_PROJECT_ID }}
         run: |
           set -euxo pipefail
           bash -c "${{ inputs.build_cmd }}"
@@ -73,13 +86,13 @@ jobs:
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
 
-          # Key (verbatim)
+          # Key
           printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" | tr -d '\r' > ~/.ssh/id_rsa
 
           chmod 600 ~/.ssh/id_rsa
           ssh-keygen -y -f ~/.ssh/id_rsa > /dev/null
 
-          # Clean secrets (kill CR/LF + trim)
+          # Clean user/port/host secrets
           SSH_PORT_CLEAN="$(printf '%s' '${{ secrets.SSH_PORT }}' | tr -d '\r\n' | xargs)"
           SSH_USER_CLEAN="$(printf '%s' '${{ secrets.SSH_USER }}' | tr -d '\r\n' | xargs)"
           SSH_HOST_CLEAN="$(printf '%s' '${{ secrets.SSH_HOST }}' | tr -d '\r\n' | xargs)"
@@ -91,7 +104,7 @@ jobs:
             echo "SSH_TARGET=$SSH_USER_CLEAN@$SSH_HOST_CLEAN"
           } >> "$GITHUB_ENV"
 
-      - name: Check SSH connectivity (non-interactive)
+      - name: Check SSH connectivity
         shell: bash
         run: |
           set -euxo pipefail
@@ -103,7 +116,7 @@ jobs:
             -o ConnectTimeout=10 \
             "$SSH_TARGET" 'echo OK'
 
-      - name: Ensure deploy path exists (server)
+      - name: Ensure deploy path exists
         shell: bash
         run: |
           set -euxo pipefail
@@ -115,14 +128,12 @@ jobs:
             "$SSH_TARGET" \
             "mkdir -p '${{ inputs.deploy_path }}'"
 
-      - name: Deploy via rsync (build output only)
+      - name: Deploy via rsync
         shell: bash
         run: |
           set -euxo pipefail
           SRC_DIR="${{ steps.out.outputs.dir }}"
-          echo "Deploying folder: $SRC_DIR/ -> ${{ inputs.deploy_path }}/"
 
-          # Build ssh args as an array to avoid broken -o strings
           SSH_ARGS=(
             -i "$HOME/.ssh/id_rsa"
             -p "$SSH_PORT_CLEAN"
