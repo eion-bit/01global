@@ -61,6 +61,13 @@ jobs:
         run: |
           set -euxo pipefail
           bash -c "${{ inputs.build_cmd }}"
+        - name: Debug build output
+        if: always()
+        shell: bash
+        run: |
+          echo "===== BUILD OUTPUT (ROOT) ====="
+          ls -R .
+          echo "================================"
 
       - name: Decide build output folder
         id: out
