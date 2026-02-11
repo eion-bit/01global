@@ -9,7 +9,7 @@ on:
       deploy_path:
         required: true
         type: string
-      pre_build:           # ⭐ NEW INPUT
+      pre_build:
         required: false
         type: string
         default: ""
@@ -44,7 +44,7 @@ jobs:
           node-version: 20
           cache: npm
 
-      # ⭐ NEW: Run pre-build hook
+      # ⭐ RUN PRE-BUILD
       - name: Run pre-build commands
         if: ${{ inputs.pre_build != '' }}
         shell: bash
@@ -52,16 +52,23 @@ jobs:
           set -euxo pipefail
           bash -c "${{ inputs.pre_build }}"
 
+      # ⭐ BUILD
       - name: Install & build
         shell: bash
-        env:
-          VITE_SUPABASE_URL: ${{ env.VITE_SUPABASE_URL }}
-          VITE_SUPABASE_ANON_KEY: ${{ env.VITE_SUPABASE_ANON_KEY }}
-          VITE_SUPABASE_PROJECT_ID: ${{ env.VITE_SUPABASE_PROJECT_ID }}
         run: |
           set -euxo pipefail
           bash -c "${{ inputs.build_cmd }}"
 
+      # ⭐ DEBUG BUILD (NEW)
+      - name: Debug build output
+        if: always()
+        shell: bash
+        run: |
+          echo "===== BUILD OUTPUT ====="
+          ls -R .
+          echo "========================"
+
+      # ⭐ FIND BUILD DIR
       - name: Decide build output folder
         id: out
         shell: bash
@@ -79,20 +86,17 @@ jobs:
             exit 1
           fi
 
-      - name: Setup SSH (key + clean vars)
+      # ⭐ SSH SETUP
+      - name: Setup SSH
         shell: bash
         run: |
           set -euxo pipefail
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
 
-          # Key
           printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" | tr -d '\r' > ~/.ssh/id_rsa
-
           chmod 600 ~/.ssh/id_rsa
-          ssh-keygen -y -f ~/.ssh/id_rsa > /dev/null
 
-          # Clean user/port/host secrets
           SSH_PORT_CLEAN="$(printf '%s' '${{ secrets.SSH_PORT }}' | tr -d '\r\n' | xargs)"
           SSH_USER_CLEAN="$(printf '%s' '${{ secrets.SSH_USER }}' | tr -d '\r\n' | xargs)"
           SSH_HOST_CLEAN="$(printf '%s' '${{ secrets.SSH_HOST }}' | tr -d '\r\n' | xargs)"
@@ -104,44 +108,37 @@ jobs:
             echo "SSH_TARGET=$SSH_USER_CLEAN@$SSH_HOST_CLEAN"
           } >> "$GITHUB_ENV"
 
+      # ⭐ TEST SSH
       - name: Check SSH connectivity
         shell: bash
         run: |
           set -euxo pipefail
-          ssh \
-            -i ~/.ssh/id_rsa \
-            -p "$SSH_PORT_CLEAN" \
-            -o StrictHostKeyChecking=accept-new \
-            -o UserKnownHostsFile=/dev/null \
-            -o ConnectTimeout=10 \
-            "$SSH_TARGET" 'echo OK'
+          ssh -i ~/.ssh/id_rsa \
+              -p "$SSH_PORT_CLEAN" \
+              -o StrictHostKeyChecking=accept-new \
+              -o UserKnownHostsFile=/dev/null \
+              "$SSH_TARGET" 'echo OK'
 
+      # ⭐ CREATE DEPLOY PATH
       - name: Ensure deploy path exists
         shell: bash
         run: |
           set -euxo pipefail
-          ssh \
-            -i ~/.ssh/id_rsa \
-            -p "$SSH_PORT_CLEAN" \
-            -o StrictHostKeyChecking=accept-new \
-            -o UserKnownHostsFile=/dev/null \
-            "$SSH_TARGET" \
-            "mkdir -p '${{ inputs.deploy_path }}'"
+          ssh -i ~/.ssh/id_rsa \
+              -p "$SSH_PORT_CLEAN" \
+              -o StrictHostKeyChecking=accept-new \
+              -o UserKnownHostsFile=/dev/null \
+              "$SSH_TARGET" \
+              "mkdir -p '${{ inputs.deploy_path }}'"
 
+      # ⭐ DEPLOY
       - name: Deploy via rsync
         shell: bash
         run: |
           set -euxo pipefail
           SRC_DIR="${{ steps.out.outputs.dir }}"
 
-          SSH_ARGS=(
-            -i "$HOME/.ssh/id_rsa"
-            -p "$SSH_PORT_CLEAN"
-            -o StrictHostKeyChecking=accept-new
-            -o UserKnownHostsFile=/dev/null
-          )
-
           rsync -avz --delete \
-            -e "ssh ${SSH_ARGS[*]}" \
+            -e "ssh -i ~/.ssh/id_rsa -p $SSH_PORT_CLEAN -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null" \
             "$SRC_DIR"/ \
             "$SSH_TARGET:${{ inputs.deploy_path }}/"
