@@ -1,0 +1,250 @@
+name: Deploy (reusable v2)
+
+# G6 versioned deployment workflow.
+# Authoritative path once copied: eion-bit/01global/.github/workflows/deploy-reusable-v2.yml
+# deploy-reusable.yml (v1) is intentionally left byte-unchanged.
+#
+# Authority contract:
+#   - build_cmd and pre_build are DELIBERATELY EXECUTABLE trusted inputs. Only a
+#     repository already permitted to call this workflow can supply them.
+#   - deploy_path and build_output_dir are DATA. They are never allowed to become
+#     executable shell text and are validated fail-closed before use.
+#   - deploy_path is accepted only against an explicit allowlist of deployment
+#     shapes. A new legitimate shape requires a reviewed amendment to this file.
+#   - deployment output must resolve inside $GITHUB_WORKSPACE and may not be the
+#     repository root itself.
+#   - contents-copy semantics: "<resolved-output>/" -> "<deploy_path>/"
+#   - rsync --delete preserved, scoped to the validated destination only.
+#   - secret contract is identical to v1: SSH_PRIVATE_KEY, SSH_HOST, SSH_PORT, SSH_USER.
+
+on:
+  workflow_call:
+    inputs:
+      build_cmd:
+        description: Build command executed at the repository root (trusted, executable).
+        type: string
+        required: true
+      pre_build:
+        description: Optional command executed before build_cmd (trusted, executable).
+        type: string
+        required: false
+        default: ""
+      deploy_path:
+        description: Absolute destination directory on the target host. No trailing slash.
+        type: string
+        required: true
+      build_output_dir:
+        description: Explicit output directory relative to the checkout. When empty, dist -> build -> out is tried in order.
+        type: string
+        required: false
+        default: ""
+      emit_build_info:
+        description: Write build-info.json into the resolved output directory.
+        type: boolean
+        required: false
+        default: true
+      node_version:
+        type: string
+        required: false
+        default: "20"
+    secrets:
+      SSH_PRIVATE_KEY:
+        required: true
+      SSH_HOST:
+        required: true
+      SSH_PORT:
+        required: true
+      SSH_USER:
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Install deployment tooling
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y rsync openssh-client
+
+      - name: Validate deploy path
+        id: guard
+        env:
+          DEPLOY_PATH: ${{ inputs.deploy_path }}
+        run: |
+          set -euo pipefail
+          # ---- BEGIN deploy-path-guard ----
+          p="${DEPLOY_PATH-}"
+          fail() { echo "deploy_path_rejected: $1" >&2; exit 1; }
+
+          [ -n "$p" ] || fail empty
+
+          # Reject newlines and any embedded control characters before anything else.
+          if [ "$(printf '%s' "$p" | wc -l | tr -d ' ')" != "0" ]; then fail newline; fi
+          if printf '%s' "$p" | LC_ALL=C grep -q '[[:cntrl:]]'; then fail control_character; fi
+
+          # Fail-closed allowlist of accepted deployment shapes.
+          # Anything not matched here is rejected, including /etc, /root, /home,
+          # /var, /quipu/quarantine and every unknown /quipu or /soeasy path.
+          # Variable path components must start and end with [a-z0-9]; dots,
+          # hyphens (and underscores for containers) are only allowed internally.
+          # This rejects ".", "..", ".hidden", "example.", "example-", "-".
+          site='[a-z0-9]([a-z0-9.-]*[a-z0-9])?'
+          cont='[a-z0-9]([a-z0-9._-]*[a-z0-9])?'
+          if printf '%s' "$p" | LC_ALL=C grep -Eq "^/quipu/websites/${site}/public$"; then
+            :
+          elif printf '%s' "$p" | LC_ALL=C grep -Eq "^/soeasy/websites/${site}/public$"; then
+            :
+          elif printf '%s' "$p" | LC_ALL=C grep -Eq "^/soeasy/containers/${cont}$"; then
+            :
+          else
+            fail not_allowlisted
+          fi
+
+          # Consecutive dots are never a legitimate component spelling.
+          case "$p" in
+            *..*) fail consecutive_dots ;;
+          esac
+
+          # Defence in depth: traversal can never survive the allowlist, but assert it.
+          case "$p" in
+            *..*) fail traversal ;;
+            *//*) fail empty_segment ;;
+          esac
+
+          echo "deploy_path=$p" >> "${GITHUB_OUTPUT:-/dev/null}"
+          echo "deploy_path accepted: $p"
+          # ---- END deploy-path-guard ----
+
+      - name: Pre-build
+        env:
+          PRE_BUILD: ${{ inputs.pre_build }}
+        run: |
+          set -euo pipefail
+          # pre_build is a trusted executable input; run it only when supplied.
+          if [ -n "${PRE_BUILD-}" ]; then
+            bash -c "$PRE_BUILD"
+          else
+            echo "no pre_build supplied"
+          fi
+
+      - name: Build
+        env:
+          BUILD_CMD: ${{ inputs.build_cmd }}
+        run: |
+          set -euo pipefail
+          # build_cmd is a trusted executable input supplied by an authorised caller.
+          bash -c "$BUILD_CMD"
+
+      - name: Resolve output directory
+        id: output
+        env:
+          BUILD_OUTPUT_DIR: ${{ inputs.build_output_dir }}
+        run: |
+          set -euo pipefail
+          # ---- BEGIN output-resolver ----
+          explicit="${BUILD_OUTPUT_DIR-}"
+          workspace="${GITHUB_WORKSPACE:-$PWD}"
+          fail() { echo "build_output_dir_rejected: $1" >&2; exit 1; }
+
+          ws_real="$(realpath "$workspace")" || fail workspace_unresolvable
+
+          candidate=""
+          if [ -n "$explicit" ]; then
+            if printf '%s' "$explicit" | LC_ALL=C grep -q '[[:cntrl:]]'; then fail control_character; fi
+            case "$explicit" in
+              /*) fail absolute ;;
+              *..*) fail traversal ;;
+            esac
+            candidate="${explicit%/}"
+            [ -n "$candidate" ] || fail empty
+          else
+            for c in dist build out; do
+              if [ -e "$c" ]; then candidate="$c"; break; fi
+            done
+            [ -n "$candidate" ] || fail not_found
+          fi
+
+          [ -e "$candidate" ] || fail missing
+          resolved="$(realpath "$candidate")" || fail unresolvable
+          [ -d "$resolved" ] || fail not_a_directory
+
+          case "$resolved/" in
+            "$ws_real"/*) ;;
+            *) fail escapes_workspace ;;
+          esac
+          if [ "$resolved" = "$ws_real" ]; then fail repository_root; fi
+
+          echo "output_dir=$resolved" >> "${GITHUB_OUTPUT:-/dev/null}"
+          echo "output directory resolved: $resolved"
+          # ---- END output-resolver ----
+
+      - name: Write build-info.json
+        if: ${{ inputs.emit_build_info }}
+        env:
+          OUTPUT_DIR: ${{ steps.output.outputs.output_dir }}
+          DEPLOY_PATH: ${{ steps.guard.outputs.deploy_path }}
+          REPOSITORY: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          REF_NAME: ${{ github.ref_name }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          # ---- BEGIN build-info ----
+          node -e '
+            const fs = require("fs");
+            const path = require("path");
+            const info = {
+              schema: "g6.build-info/1",
+              repository: process.env.REPOSITORY || "",
+              sha: process.env.SHA || "",
+              ref: process.env.REF_NAME || "",
+              run_id: process.env.RUN_ID || "",
+              run_attempt: process.env.RUN_ATTEMPT || "",
+              built_at: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
+              deploy_path: process.env.DEPLOY_PATH || "",
+            };
+            const target = path.join(process.env.OUTPUT_DIR, "build-info.json");
+            fs.writeFileSync(target, JSON.stringify(info, null, 2) + "\n");
+            process.stdout.write(fs.readFileSync(target, "utf8"));
+          '
+          # ---- END build-info ----
+
+      - name: Configure SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -p "$SSH_PORT" -H "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Deploy
+        env:
+          OUTPUT_DIR: ${{ steps.output.outputs.output_dir }}
+          DEPLOY_PATH: ${{ steps.guard.outputs.deploy_path }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -euo pipefail
+          # ---- BEGIN rsync ----
+          rsync -avz --delete --delete-after \
+            -e "ssh -i ~/.ssh/id_deploy -p $SSH_PORT -o StrictHostKeyChecking=yes" \
+            "${OUTPUT_DIR}/" \
+            "${SSH_USER}@${SSH_HOST}:${DEPLOY_PATH}/"
+          # ---- END rsync ----
