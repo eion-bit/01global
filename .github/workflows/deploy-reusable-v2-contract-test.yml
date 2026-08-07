@@ -1,0 +1,31 @@
+name: Contract test — deploy-reusable-v2
+
+# 01global-owned executable authority for the versioned deployment workflow.
+# It validates the workflow at its final authoritative path in THIS repository:
+#   .github/workflows/deploy-reusable-v2.yml
+# The Vitest file in eion-bit/deploy-fixtheworld is a staging proof only.
+
+on:
+  push:
+    paths:
+      - '.github/workflows/deploy-reusable-v2.yml'
+      - '.github/workflows/deploy-reusable-v2-contract-test.yml'
+      - 'scripts/deploy-reusable-v2-contract-test.mjs'
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install rsync
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y rsync
+      - name: Run contract test
+        run: node scripts/deploy-reusable-v2-contract-test.mjs
